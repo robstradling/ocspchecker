@@ -21,14 +21,17 @@ import (
 	"log"
 	"net/http"
 	"strings"
-	"time"
 
 	"golang.org/x/crypto/ocsp"
 )
 
 var (
-	destURL  = flag.String("url", "", "url to check")
-	certPath = flag.String("pem", "", "pem to check")
+	destURL    = flag.String("url", "", "url to check")
+	issuerPath = flag.String("issuerpem", "", "issuer cert (PEM)")
+	issuerURL  = flag.String("issuerurl", "", "url of issuer cert (PEM)")
+	certPath   = flag.String("certpem", "", "cert (PEM) to check")
+	certURL    = flag.String("certurl", "", "url of cert (PEM) to check")
+	ocspURL    = flag.String("ocspurl", "", "url of OCSP responder")
 
 	authorityInfoAccess = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 1}
 	aiaOCSP             = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1}
@@ -99,17 +102,19 @@ func grabServerCert(connState *tls.ConnectionState) *x509.Certificate {
 }
 
 func manualCheck(ee *x509.Certificate, issuer *x509.Certificate) error {
-	ocspURL := ee.OCSPServer[0]
+	if *ocspURL == "" {
+		*ocspURL = ee.OCSPServer[0]
+	}
 	log.Printf("Server: %v\n", ee.Subject.CommonName)
 	log.Printf("Issuer: %v\n", issuer.Subject.CommonName)
-	log.Printf("OCSP URL: %v\n", ocspURL)
+	log.Printf("OCSP URL: %v\n", *ocspURL)
 
 	ocspReq, err := ocsp.CreateRequest(ee, issuer, nil)
 	if err != nil {
 		return fmt.Errorf("error creating ocsp request: %v", err)
 	}
 	body := bytes.NewReader(ocspReq)
-	req, err := http.NewRequest("POST", ocspURL, body)
+	req, err := http.NewRequest("POST", *ocspURL, body)
 	if err != nil {
 		return fmt.Errorf("error creating http post request: %v", err)
 	}
@@ -173,29 +178,54 @@ func processURL() error {
 	return stapledCheck(server, issuer, staple)
 }
 
-func processFile() error {
-	certPEM, err := ioutil.ReadFile(*certPath)
-	if err != nil {
-		log.Fatalf("Error reading file: %v", err)
-	}
-
-	block, _ := pem.Decode([]byte(certPEM))
+func loadCertFromPEM(pemdata []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(pemdata)
 	if block == nil {
 		log.Fatalf("failed to parse certificate PEM")
 	}
 
-	endEntity, err := x509.ParseCertificate(block.Bytes)
+	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
 		log.Fatalf("failed to parse certificate: %v\n", err)
 	}
 
-	var aiaURL *string
+	return cert, err
+}
 
-	for _, ext := range endEntity.Extensions {
+func loadCertFromPEMFile(pathname *string) (*x509.Certificate, error) {
+	certPEM, err := ioutil.ReadFile(*pathname)
+	if err != nil {
+		log.Fatalf("Error reading file: %v", err)
+	}
+
+	return loadCertFromPEM([]byte(certPEM))
+}
+
+func fetchCertFromPEMURL(url *string) (*x509.Certificate, error) {
+	resp, err := http.Get(*url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	certBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatalf("failed to read response body")
+		return nil, err
+	}
+
+	return loadCertFromPEM([]byte(certBytes))
+}
+
+func fetchCertFromAIAURL(cert *x509.Certificate) (*x509.Certificate, error) {
+	var aiaURL *string
+	var err error
+
+	for _, ext := range cert.Extensions {
 		if ext.Id.Equal(authorityInfoAccess) {
 			url, err := decodeAIA(ext.Value)
 			if err != nil {
-				return err
+				return nil, err
 			}
 
 			if len(url) > 0 {
@@ -205,40 +235,17 @@ func processFile() error {
 	}
 
 	if aiaURL == nil {
-		return fmt.Errorf("No AIA url, and previous error was %s", err)
+		return nil, fmt.Errorf("No AIA url, and previous error was %s", err)
 	}
 
 	log.Printf("Fetching issuer certificate from %s", *aiaURL)
-
-	client := &http.Client{
-		Timeout: time.Second * 10,
-	}
-
-	response, err := client.Get(*aiaURL)
-	if err != nil {
-		return err
-	}
-
-	defer response.Body.Close()
-	certBytes, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return err
-	}
-
-	fetchedCert, err := x509.ParseCertificate(certBytes)
-	if err != nil {
-		return err
-	}
-
-	return manualCheck(endEntity, fetchedCert)
+	return fetchCertFromPEMURL(aiaURL)
 }
 
 func main() {
 	flag.Parse()
 
-	if *certPath == "" && *destURL == "" {
-		log.Fatalf("must provide a url or cert\n")
-	}
+	var err error
 
 	if *destURL != "" {
 		if !strings.HasPrefix(*destURL, "https") {
@@ -248,12 +255,45 @@ func main() {
 		if err != nil {
 			log.Fatalf("Error processing URL: %v\n", err)
 		}
-	}
 
-	if *certPath != "" {
-		err := processFile()
-		if err != nil {
-			log.Fatalf("Error processing file: %v\n", err)
+	} else if *certPath != "" || *certURL != "" {
+		var issuer *x509.Certificate
+		var cert *x509.Certificate
+		if *certPath != "" {
+			cert, err = loadCertFromPEMFile(certPath)
+			if err != nil {
+				log.Fatalf("Error processing file: %v\n", err)
+			}
+		} else if *certURL != "" {
+			cert, err = fetchCertFromPEMURL(certURL)
+			if err != nil {
+				log.Fatalf("Error processing URL: %v\n", err)
+			}
 		}
+
+		if *issuerPath != "" {
+			issuer, err = loadCertFromPEMFile(issuerPath)
+			if err != nil {
+				log.Fatalf("Error processing file: %v\n", err)
+			}
+		} else if *issuerURL != "" {
+			issuer, err = fetchCertFromPEMURL(issuerURL)
+			if err != nil {
+				log.Fatalf("Error processing URL: %v\n", err)
+			}
+		} else {
+			issuer, err = fetchCertFromAIAURL(cert)
+			if err != nil {
+				log.Fatalf("Error processing AIA URL: %v\n", err)
+			}
+		}
+
+		err := manualCheck(cert, issuer)
+		if err != nil {
+			log.Fatalf("Error performing manual check: %v\n", err)
+		}
+
+	} else {
+		log.Fatalf("must provide a url or cert\n")
 	}
 }
